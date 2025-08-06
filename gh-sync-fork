@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# gh extension: gh-sync-fork (SSH by default) + protocol/rebase-current/dry-run/verbose
+# gh extension: gh-sync-fork v1.0.0
+# Sync your local fork from upstream and push to origin
+# Supports SSH/HTTPS, dry-run, verbose mode, and advanced workflows
 set -euo pipefail
+
+VERSION="1.0.0"
 
 usage() {
   cat <<'EOF'
-gh-sync-fork - Sync your fork from upstream and push to origin
+gh-sync-fork v1.0.0 - Sync your fork from upstream and push to origin
 
 USAGE:
   gh sync-fork [options]
@@ -21,6 +25,7 @@ OPTIONS:
       --dry-run                 Print intended commands (read-only queries still run); make no changes
       --verbose                 Extra Git and network logs (sets GIT_TRACE/HTTP trace; shell xtrace)
   -h, --help                    Show help
+      --version                 Show version information
 
 EXAMPLES:
   gh sync-fork                         # SSH upstream, FF-only, push default branch
@@ -57,7 +62,8 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=1; shift;;
         --verbose) VERBOSE=1; shift;;
         -h|--help) usage; exit 0;;
-        *) echo "Unknown argument: $1"; usage; exit 1;;
+        --version) echo "gh-sync-fork v$VERSION"; exit 0;;
+        *) echo "❌ Unknown argument: $1"; usage; exit 1;;
     esac
 done
 
