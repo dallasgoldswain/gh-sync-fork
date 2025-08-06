@@ -13,7 +13,20 @@ Sync your local fork from **upstream** and push to **origin**. Supports SSH and 
 
 ## Install
 
+### From GitHub (recommended)
+
 ```bash
+gh extension install dallasgoldswain/gh-sync-fork
+```
+
+### Local development
+
+```bash
+# Clone the repository first
+git clone https://github.com/dallasgoldswain/gh-sync-fork.git
+cd gh-sync-fork
+
+# Install locally
 gh extension install .
 ```
 
