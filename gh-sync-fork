@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# gh extension: gh-sync-fork (SSH by default) + protocol/rebase-current/dry-run/verbose
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+gh-sync-fork - Sync your fork from upstream and push to origin
+
+USAGE:
+  gh sync-fork [options]
+
+OPTIONS:
+  -b, --branch <name>           Branch to sync (default: upstream default branch)
+  -s, --source <owner/repo>     Upstream source repo owner/name override
+      --protocol <ssh|https>    Protocol for upstream remote (default: ssh)
+      --merge                   Use a merge commit (default is fast-forward only)
+      --rebase                  Rebase local branch onto upstream/<branch>
+      --rebase-current          After syncing, rebase the branch you started on onto <branch>
+  -f, --force                   Use --force-with-lease when pushing (useful with rebase)
+      --no-push                 Do not push to origin after updating locally
+      --dry-run                 Print intended commands (read-only queries still run); make no changes
+      --verbose                 Extra Git and network logs (sets GIT_TRACE/HTTP trace; shell xtrace)
+  -h, --help                    Show help
+
+EXAMPLES:
+  gh sync-fork                         # SSH upstream, FF-only, push default branch
+  gh sync-fork -b develop              # sync 'develop'
+  gh sync-fork --rebase -f             # rebase default branch then force-with-lease push
+  gh sync-fork --protocol https        # use HTTPS for upstream
+  gh sync-fork --rebase-current -f     # also rebase your current feature branch onto updated base
+  gh sync-fork --dry-run               # show what would happen
+  gh sync-fork --verbose               # enable detailed Git tracing
+EOF
+}
+
+# --- parse args ---
+BRANCH=""
+SOURCE=""
+STRATEGY="ff"   # ff | merge | rebase
+FORCE_PUSH=0
+DO_PUSH=1
+PROTOCOL="ssh"  # ssh | https
+DRY_RUN=0
+REBASE_CURRENT=0
+VERBOSE=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -b|--branch) BRANCH="${2:-}"; shift 2;;
+        -s|--source) SOURCE="${2:-}"; shift 2;;
+        --protocol) PROTOCOL="${2:-}"; shift 2;;
+        --merge) STRATEGY="merge"; shift;;
+        --rebase) STRATEGY="rebase"; shift;;
+        --rebase-current) REBASE_CURRENT=1; shift;;
+        -f|--force) FORCE_PUSH=1; shift;;
+        --no-push) DO_PUSH=0; shift;;
+        --dry-run) DRY_RUN=1; shift;;
+        --verbose) VERBOSE=1; shift;;
+        -h|--help) usage; exit 0;;
+        *) echo "Unknown argument: $1"; usage; exit 1;;
+    esac
+done
+
+require() { command -v "$1" >/dev/null 2>&1 || { echo "❌ Missing dependency: $1"; exit 1; }; }
+require gh
+require git
+
+# Verbose tracing
+if [[ "$VERBOSE" -eq 1 ]]; then
+    # Git & HTTP(S) traces
+    export GIT_TRACE=1
+    export GIT_TRACE_SETUP=1
+    export GIT_TRACE_PERFORMANCE=1
+    export GIT_CURL_VERBOSE=1
+    # SSH verbosity for Git over SSH (won't affect HTTPS)
+    export GIT_SSH_COMMAND="ssh -vvv"
+    # Shell xtrace (skip during dry-run to avoid double noise)
+    if [[ "$DRY_RUN" -ne 1 ]]; then
+        set -x
+    fi
+fi
+
+# helper to run potentially mutating commands
+run() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "DRY-RUN: $*"
+    else
+        eval "$@"
+    fi
+}
+
+# Ensure we are inside a git repo
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "❌ Not inside a git repository."
+    exit 1
+fi
+
+ORIG_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+
+# --- determine upstream source repo (owner/repo) ---
+if [[ -z "$SOURCE" ]]; then
+    SOURCE="$(gh repo view --json parent --jq '.parent.nameWithOwner' 2>/dev/null || true)"
+    if [[ -z "$SOURCE" || "$SOURCE" == "null" ]]; then
+        if upstream_url="$(git remote get-url upstream 2>/dev/null)"; then
+            SOURCE="$(echo "$upstream_url" | sed -E 's#(git@|https?://)([^/:]+)[:/]([^/]+/[^/]+)(\.git)?$#\3#' | sed 's/\.git$//')"
+        fi
+    fi
+fi
+
+if [[ -z "$SOURCE" || "$SOURCE" == "null" ]]; then
+    echo "❌ Could not determine upstream. Provide it with: --source owner/repo"
+    exit 1
+fi
+
+# --- determine branch to sync ---
+if [[ -z "$BRANCH" ]]; then
+    BRANCH="$(gh repo view "$SOURCE" --json defaultBranchRef --jq '.defaultBranchRef.name')"
+    if [[ -z "$BRANCH" || "$BRANCH" == "null" ]]; then
+        echo "❌ Could not determine default branch for $SOURCE"
+        exit 1
+    fi
+fi
+
+# validate protocol
+case "$PROTOCOL" in
+    ssh|https) ;;
+    *) echo "❌ Invalid --protocol value: $PROTOCOL (expected ssh|https)"; exit 1;;
+esac
+
+echo "🔎 Source (upstream): $SOURCE"
+echo "🔎 Branch to sync   : $BRANCH"
+echo "🔎 Strategy         : $STRATEGY"
+echo "🔎 Upstream protocol: $PROTOCOL"
+[[ -n "$ORIG_BRANCH" ]] && echo "🔎 Starting on       : $ORIG_BRANCH"
+[[ "$REBASE_CURRENT" -eq 1 ]] && echo "🔎 Extra step        : rebase-current enabled"
+[[ "$DRY_RUN" -eq 1 ]] && echo "🔎 Mode              : DRY-RUN (no changes)"
+[[ "$VERBOSE" -eq 1 ]] && echo "🔎 Verbose           : Git/Shell tracing enabled"
+
+# --- ensure 'upstream' remote exists and points to SOURCE using selected protocol ---
+if [[ "$PROTOCOL" == "https" ]]; then
+    upstream_url_expected="https://github.com/${SOURCE}.git"
+else
+    upstream_url_expected="git@github.com:${SOURCE}.git"
+fi
+
+if git remote get-url upstream >/dev/null 2>&1; then
+    current_upstream="$(git remote get-url upstream)"
+    if [[ "$current_upstream" != "$upstream_url_expected" ]]; then
+        echo "ℹ️  Setting 'upstream' -> $upstream_url_expected"
+        run "git remote set-url upstream "$upstream_url_expected""
+    fi
+else
+    echo "ℹ️  Adding 'upstream' remote -> $upstream_url_expected"
+    run "git remote add upstream "$upstream_url_expected""
+fi
+
+# --- fetch remotes (mutating local refs; skipped in dry-run) ---
+echo "⬇️  Fetching upstream..."
+run "git fetch upstream --prune -v"
+echo "⬇️  Fetching origin..."
+run "git fetch origin --prune -v || true"
+
+# --- ensure target branch exists locally and checkout ---
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    run "git checkout "$BRANCH""
+else
+    if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+        run "git checkout -b "$BRANCH" origin/"$BRANCH""
+    else
+        run "git checkout -b "$BRANCH""
+    fi
+fi
+
+# --- update from upstream ---
+case "$STRATEGY" in
+    ff)
+        echo "🔁 Fast-forward from upstream/$BRANCH..."
+        run "git merge --ff-only "upstream/$BRANCH""
+    ;;
+    merge)
+        echo "🔁 Merge (no-ff) from upstream/$BRANCH..."
+        run "git merge --no-ff "upstream/$BRANCH" -m "Merge upstream/$BRANCH into $BRANCH""
+    ;;
+    rebase)
+        echo "🔁 Rebase onto upstream/$BRANCH..."
+        run "git rebase "upstream/$BRANCH""
+    ;;
+    *)
+    echo "❌ Unknown strategy: $STRATEGY"; exit 1;;
+esac
+
+# --- push updated base branch to origin ---
+if [[ "$DO_PUSH" -eq 1 ]]; then
+    if [[ "$STRATEGY" == "rebase" && "$FORCE_PUSH" -eq 1 ]]; then
+        echo "⬆️  Pushing base to origin/$BRANCH (force-with-lease)..."
+        run "git push origin "$BRANCH" --force-with-lease -v"
+    else
+        echo "⬆️  Pushing base to origin/$BRANCH..."
+        run "git push origin "$BRANCH" -v"
+    fi
+else
+    echo "➡️  Skipping push of base (per --no-push)."
+fi
+
+# --- optionally rebase the branch we started on ---
+if [[ "$REBASE_CURRENT" -eq 1 && -n "$ORIG_BRANCH" && "$ORIG_BRANCH" != "$BRANCH" ]]; then
+    echo "🔁 Rebasing '$ORIG_BRANCH' onto '$BRANCH'..."
+    run "git checkout "$ORIG_BRANCH""
+    run "git rebase "$BRANCH""
+    if [[ "$DO_PUSH" -eq 1 ]]; then
+        if [[ "$FORCE_PUSH" -eq 1 ]]; then
+            echo "⬆️  Pushing '$ORIG_BRANCH' to origin (force-with-lease)..."
+            run "git push origin "$ORIG_BRANCH" --force-with-lease -v"
+        else
+            echo "⬆️  Pushing '$ORIG_BRANCH' to origin..."
+            run "git push origin "$ORIG_BRANCH" -v"
+        fi
+    else
+        echo "➡️  Skipping push of '$ORIG_BRANCH' (per --no-push)."
+    fi
+    run "git checkout "$BRANCH""
+fi
+
+echo "✅ Sync complete."
